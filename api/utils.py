@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Iterator, Optional, Protocol
 from cachetools import TTLCache, cached
 
 if TYPE_CHECKING:
+    from models.message import UserMessage
     from models.session import Session
 
 
@@ -324,6 +325,38 @@ def extract_prompt_from_content(content: str) -> str:
     return ""
 
 
+def prompt_from_user_message(
+    msg: "UserMessage", prev: Optional["UserMessage"] = None
+) -> Optional[str]:
+    """
+    Return the prompt the user typed in a message, or None if it holds none.
+
+    Skips tool results, meta messages (e.g., the <local-command-caveat> that
+    opens sessions started with /clear), local command output, command
+    messages without arguments (e.g., /clear), and the built-in command a
+    caveat introduces, even with arguments (e.g., /model fable).
+
+    Args:
+        msg: The user message to inspect
+        prev: The user message before msg, if any
+
+    Returns:
+        The extracted prompt, or None if the message is not a real user prompt
+    """
+    if not msg.content or msg.is_tool_result or msg.is_meta:
+        return None
+    if msg.content.lstrip().startswith("<local-command-stdout>"):
+        return None
+    if (
+        prev is not None
+        and prev.is_meta
+        and prev.content.startswith("<local-command-caveat>")
+        and "<command-name>" in msg.content
+    ):
+        return None
+    return extract_prompt_from_content(msg.content) or None
+
+
 def get_initial_prompt(session: "Session", max_length: Optional[int] = None) -> Optional[str]:
     """
     Extract the initial user prompt from a session.
@@ -337,13 +370,14 @@ def get_initial_prompt(session: "Session", max_length: Optional[int] = None) -> 
                    If None, returns the full prompt without truncation.
 
     Returns:
-        The initial prompt (potentially truncated), or None if no user messages exist
+        The initial prompt (potentially truncated), or None if no message
+        holds a prompt the user typed
     """
+    prev = None
     for msg in session.iter_user_messages():
-        if msg.content:
-            # Extract actual prompt from command-wrapped content
-            prompt = extract_prompt_from_content(msg.content)
-
+        prompt = prompt_from_user_message(msg, prev)
+        prev = msg
+        if prompt:
             if max_length is not None:
                 return prompt[:max_length]
             return prompt
