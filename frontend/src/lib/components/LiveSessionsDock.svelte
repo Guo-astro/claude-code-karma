@@ -3,7 +3,7 @@
 	import { scale } from 'svelte/transition';
 	import { page } from '$app/stores';
 	import { afterNavigate } from '$app/navigation';
-	import { FolderOpen, Radio, X } from 'lucide-svelte';
+	import { ChevronUp, FolderOpen, Radio, X } from 'lucide-svelte';
 	import { liveSessionsFeed } from '$lib/stores/liveSessionsFeed';
 	import { statusConfig } from '$lib/live-session-config';
 	import TerminalFocusButton from '$lib/components/TerminalFocusButton.svelte';
@@ -21,14 +21,35 @@
 	const HIDDEN_ROUTES = new Set(['/', '/sessions']);
 	const hidden = $derived(HIDDEN_ROUTES.has($page.url.pathname));
 
-	const sessions = $derived(visibleLiveSessions($liveSessionsFeed));
+	// Waiting rows first so the panel opens on what the pill announces; the stable sort keeps API order within each group.
+	const sessions = $derived(
+		[...visibleLiveSessions($liveSessionsFeed)].sort(
+			(a, b) => Number(b.status === 'waiting') - Number(a.status === 'waiting')
+		)
+	);
 
 	// Only "waiting" (blocked on you) earns motion — pulsing for merely-busy trains you to ignore it.
-	const hasWorking = $derived(sessions.some((s) => s.status === 'active'));
-	const needsInput = $derived(sessions.some((s) => s.status === 'waiting'));
+	const waitingCount = $derived(sessions.filter((s) => s.status === 'waiting').length);
+	const waitingAnnouncement = $derived(
+		waitingCount
+			? `${waitingCount} ${waitingCount === 1 ? 'session' : 'sessions'} waiting on you`
+			: ''
+	);
 
 	let expanded = $state(false);
 	let container: HTMLDivElement | undefined = $state();
+	let pill: HTMLButtonElement | undefined = $state();
+
+	function collapse() {
+		const focusInDock = !!container?.contains(document.activeElement);
+		expanded = false;
+		// The panel unmounts on collapse, so focus inside it would fall to <body>.
+		if (focusInDock || document.activeElement === document.body) pill?.focus();
+	}
+
+	function handleKeydown(e: KeyboardEvent) {
+		if (e.key === 'Escape' && expanded && !e.defaultPrevented) collapse();
+	}
 
 	// Collapse after navigation, not on row click — unmounting the anchor mid-click cancels it.
 	afterNavigate(() => {
@@ -54,20 +75,50 @@
 	});
 </script>
 
+<svelte:window onkeydown={handleKeydown} />
+
 {#if !hidden && sessions.length > 0}
+	<!-- Pill before panel in the DOM so Tab after opening reaches the panel; column-reverse keeps the panel above. -->
 	<div class="dock" bind:this={container} transition:scale={{ duration: 150, start: 0.9 }}>
+		<button
+			bind:this={pill}
+			class="dock-pill"
+			class:expanded
+			class:attention={waitingCount > 0}
+			onclick={() => (expanded = !expanded)}
+			aria-expanded={expanded}
+			aria-controls={expanded ? 'live-sessions-dock-panel' : undefined}
+		>
+			<span class="dock-icon" aria-hidden="true"><Radio size={16} strokeWidth={2} /></span>
+			{#if waitingCount > 0}
+				<span class="waiting-dot" aria-hidden="true"></span>
+				<span class="dock-waiting"
+					>{waitingCount} waiting<span class="sr-only"> on you,</span></span
+				>
+				<span class="dock-sep" aria-hidden="true">·</span>
+			{/if}
+			<span class="dock-count"
+				>{sessions.length} live<span class="sr-only">
+					{sessions.length === 1 ? 'session' : 'sessions'}</span
+				></span
+			>
+			<span class="dock-chevron" aria-hidden="true"
+				><ChevronUp size={16} strokeWidth={2} /></span
+			>
+		</button>
+
 		{#if expanded}
-			<div class="dock-panel" transition:scale={{ duration: 140, start: 0.94, opacity: 0 }}>
+			<div
+				id="live-sessions-dock-panel"
+				class="dock-panel"
+				transition:scale={{ duration: 140, start: 0.94, opacity: 0 }}
+			>
 				<div class="dock-panel-header">
 					<span class="dock-panel-title">
 						<Radio size={15} strokeWidth={2} class="text-[var(--success)]" />
 						Live sessions
 					</span>
-					<button
-						class="dock-close"
-						onclick={() => (expanded = false)}
-						aria-label="Collapse"
-					>
+					<button class="dock-close" onclick={collapse} aria-label="Collapse">
 						<X size={17} strokeWidth={2} />
 					</button>
 				</div>
@@ -129,24 +180,11 @@
 				</div>
 			</div>
 		{/if}
-
-		<button
-			class="dock-pill"
-			class:attention={needsInput}
-			onclick={() => (expanded = !expanded)}
-			aria-expanded={expanded}
-			aria-label={needsInput ? 'Live sessions — one is waiting on you' : 'Live sessions'}
-		>
-			<span class="dock-icon">
-				<Radio size={13} strokeWidth={2} />
-			</span>
-			<span class="dock-count">{sessions.length}</span>
-			{#if needsInput || hasWorking}
-				<span class="dock-badge" class:pulse={needsInput}></span>
-			{/if}
-		</button>
 	</div>
 {/if}
+
+<!-- Mounted outside the block so it exists before the first change; it only re-announces when the waiting count changes. -->
+<span class="sr-only" role="status">{waitingAnnouncement}</span>
 
 <style>
 	.dock {
@@ -156,35 +194,48 @@
 		/* Below modal scrims (50) so dialogs dim it; the header (50) never overlaps it. */
 		z-index: 40;
 		display: flex;
-		flex-direction: column;
+		flex-direction: column-reverse;
 		align-items: flex-end;
 		gap: var(--spacing-2);
 		/* Grows from its bottom-right anchor — centre scaling reads as diagonal drift. */
 		transform-origin: bottom right;
 	}
 
+	@media (max-width: 480px) {
+		.dock {
+			right: var(--spacing-4);
+			bottom: var(--spacing-4);
+		}
+	}
+
+	/* Quiet while sessions just run; the whole pill escalates only when one is blocked on you. */
 	.dock-pill {
 		position: relative;
 		display: inline-flex;
 		align-items: center;
 		gap: var(--spacing-2);
-		padding: var(--spacing-2) var(--spacing-3) var(--spacing-2) var(--spacing-2);
-		border: 1px solid var(--border);
+		min-height: 44px;
+		padding: 0 var(--spacing-3) 0 var(--spacing-4);
+		/* A real border, even when transparent, keeps the edge in forced-colors mode. */
+		border: 1px solid var(--border-hover);
 		border-radius: 999px;
 		background: var(--bg-base);
-		color: var(--text-secondary);
-		box-shadow: var(--shadow-lg);
+		color: var(--text-primary);
+		box-shadow: var(--shadow-elevated), var(--shadow-lg);
+		font-size: 14px;
+		font-weight: 600;
+		font-variant-numeric: tabular-nums;
+		white-space: nowrap;
 		cursor: pointer;
 		transition:
-			background var(--duration-fast),
+			transform var(--duration-fast),
 			border-color var(--duration-fast),
+			background-color var(--duration-fast),
 			color var(--duration-fast),
-			transform var(--duration-fast);
+			box-shadow var(--duration-fast);
 	}
 
 	.dock-pill:hover {
-		background: var(--bg-subtle);
-		color: var(--text-primary);
 		border-color: var(--accent);
 		transform: translateY(-1px);
 	}
@@ -193,41 +244,74 @@
 		transform: translateY(0);
 	}
 
+	.dock-pill:focus-visible {
+		outline: var(--focus-ring-width) solid var(--focus-ring-color);
+		outline-offset: var(--focus-ring-offset);
+	}
+
 	.dock-pill.attention {
-		border-color: color-mix(in srgb, var(--info) 60%, var(--border));
+		border-color: transparent;
+		background: var(--info);
+		color: var(--bg-base);
+	}
+
+	.dock-pill.attention:hover {
+		border-color: transparent;
+		box-shadow:
+			0 0 0 3px var(--info-subtle),
+			var(--shadow-elevated),
+			var(--shadow-lg);
 	}
 
 	.dock-icon {
 		display: inline-flex;
-		align-items: center;
-		justify-content: center;
-		width: 24px;
-		height: 24px;
+		color: var(--success);
+	}
+
+	.dock-pill.attention .dock-icon {
+		color: inherit;
+	}
+
+	.dock-pill.attention .dock-count {
+		font-weight: 500;
+	}
+
+	.dock-sep {
+		opacity: 0.7;
+	}
+
+	.waiting-dot {
+		width: 7px;
+		height: 7px;
 		border-radius: 50%;
-		background: var(--nav-teal-subtle);
-		color: var(--nav-teal);
-	}
-
-	.dock-count {
-		font-size: 12px;
-		font-weight: 600;
-		font-variant-numeric: tabular-nums;
-	}
-
-	.dock-badge {
-		position: absolute;
-		top: -1px;
-		right: -1px;
-		width: 9px;
-		height: 9px;
-		border-radius: 50%;
-		background: var(--success);
-		border: 2px solid var(--bg-base);
-	}
-
-	.dock-badge.pulse {
-		background: var(--info);
+		background: currentColor;
 		animation: dock-pulse 2s ease infinite;
+	}
+
+	.dock-chevron {
+		display: inline-flex;
+		opacity: 0.7;
+		transition: transform var(--duration-fast);
+	}
+
+	.dock-pill.expanded .dock-chevron {
+		transform: rotate(180deg);
+	}
+
+	/* Phones: the waiting state keeps only "N waiting"; the live count stays in the accessible name. */
+	@media (max-width: 480px) {
+		.dock-pill.attention .dock-sep {
+			display: none;
+		}
+
+		.dock-pill.attention .dock-count {
+			position: absolute;
+			width: 1px;
+			height: 1px;
+			margin: -1px;
+			overflow: hidden;
+			clip-path: inset(50%);
+		}
 	}
 
 	@keyframes dock-pulse {
@@ -243,7 +327,7 @@
 	}
 
 	.dock-panel {
-		width: 400px;
+		width: min(400px, calc(100vw - 2 * var(--spacing-4)));
 		max-height: 75vh;
 		display: flex;
 		flex-direction: column;
@@ -426,12 +510,13 @@
 	}
 
 	@media (prefers-reduced-motion: reduce) {
-		.dock-badge.pulse,
+		.waiting-dot,
 		.status-dot.pulse {
 			animation: none;
 		}
 
-		.dock-pill {
+		.dock-pill,
+		.dock-chevron {
 			transition: none;
 		}
 
