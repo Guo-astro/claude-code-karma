@@ -322,9 +322,9 @@ def spawn_detached(
     # once Popen has taken it -- leaving it open leaks a handle per call.
     handle = open(log_path, "ab")
     try:
-        # Windows: detach from this console and never flash a window.
+        # Not DETACHED_PROCESS: Windows ignores CREATE_NO_WINDOW beside it and children flash consoles.
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(
-            subprocess, "DETACHED_PROCESS", 0
+            subprocess, "CREATE_NEW_PROCESS_GROUP", 0
         )
         return _popen(args, cwd, handle, use_login_shell, env, flags)
     finally:
