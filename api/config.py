@@ -99,13 +99,23 @@ class Settings(BaseSettings):
         ],
         description="Allowed CORS origins",
     )
+    # Origins allowed to drive keystroke-injecting endpoints; narrower than cors_origins on purpose (only Karma's :5180).
+    rc_trusted_origins: List[str] = Field(
+        default=[
+            "http://localhost:5180",
+            "http://127.0.0.1:5180",
+        ],
+        description="Origins permitted to POST /live-sessions/{id}/remote-control",
+    )
+
     cors_allow_credentials: bool = Field(default=True, description="Allow credentials in CORS")
     cors_allow_methods: List[str] = Field(
         default=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
         description="Allowed HTTP methods for CORS",
     )
     cors_allow_headers: List[str] = Field(
-        default=["Content-Type", "Authorization"],
+        # X-Karma-RC (Remote Control CSRF marker) must be listed or the CORS preflight 400s.
+        default=["Content-Type", "Authorization", "X-Karma-RC"],
         description="Allowed headers for CORS",
     )
 

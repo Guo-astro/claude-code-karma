@@ -29,7 +29,9 @@ Computed Status (based on state + activity):
 The frontend uses idle_seconds for progressive visual styling (yellow → red as idle time increases).
 """
 
+import asyncio
 import logging
+import re
 import sys
 from pathlib import Path
 from typing import Annotated
@@ -54,7 +56,20 @@ from models.live_session import (
 )
 from models.project import Project
 from routers.projects import safely_resolve_project
-from schemas import LiveSessionsResponse, LiveSessionSummary, TerminalFocusResult
+from schemas import (
+    LiveSessionsResponse,
+    LiveSessionSummary,
+    RemoteControlState,
+    RemoteControlToggleRequest,
+    RemoteControlToggleResult,
+    TerminalFocusResult,
+)
+from services.remote_control import (
+    RC_COMMAND,
+    can_send_remote_control,
+    read_remote_control_state,
+    type_remote_control_command,
+)
 from services.terminal_focus import can_focus, focus_terminal
 
 logger = logging.getLogger(__name__)
@@ -154,6 +169,8 @@ def state_to_summary(
     message_count: int | None = None,
     subagent_count: int | None = None,
     slug_override: str | None = None,
+    include_remote_control: bool = False,
+    projects_dir: Path | None = None,
 ) -> LiveSessionSummary:
     """Convert LiveSessionState to LiveSessionSummary response schema.
 
@@ -162,6 +179,9 @@ def state_to_summary(
         message_count: Optional message count from session JSONL (for live stats)
         subagent_count: Optional subagent count from session (for live stats)
         slug_override: Optional session slug from JSONL (fallback if not in state)
+        include_remote_control: Read Remote Control state from the transcript.
+            Off by default — it opens the JSONL, too costly for the 1s-polled
+            list endpoints; only the single-session GET needs it.
     """
     status = determine_status(state)
 
@@ -188,6 +208,14 @@ def state_to_summary(
     # whether the *host running the API* has an identifier it could act on.
     terminal_dict = state.terminal.model_dump() if state.terminal else None
 
+    remote_control = None
+    can_remote_control = False
+    if include_remote_control:
+        can_remote_control = can_send_remote_control(terminal_dict)
+        remote_control = RemoteControlState(
+            **read_remote_control_state(state.transcript_path, state.session_ids, projects_dir)
+        )
+
     return LiveSessionSummary(
         session_id=state.session_id,
         state=state.state.value,
@@ -213,6 +241,8 @@ def state_to_summary(
         total_subagent_count=state.total_subagent_count,
         terminal=terminal_dict,
         can_focus_terminal=can_focus(terminal_dict),
+        remote_control=remote_control,
+        can_remote_control=can_remote_control,
     )
 
 
@@ -513,7 +543,7 @@ def get_live_session(
             detail=f"Live session not found: {session_id}",
         )
 
-    return state_to_summary(state)
+    return state_to_summary(state, include_remote_control=True, projects_dir=config.projects_dir)
 
 
 def _reject_cross_origin(request: Request, config: Settings) -> None:
@@ -569,6 +599,265 @@ def focus_session_terminal(
 
     result = focus_terminal(terminal_dict)
     return TerminalFocusResult(**result)
+
+
+# Typed at any status except these (open dialog, no REPL yet, no process); ACTIVE is allowed since Claude Code queues the command.
+_RC_BLOCKED_STATUSES = {
+    SessionStatus.WAITING_INPUT,
+    SessionStatus.STARTING,
+    SessionStatus.ENDED,
+}
+
+# Confirm-poll budget: reads the transcript before the first sleep and is hard-bounded.
+_RC_CONFIRM_ATTEMPTS = 6
+_RC_CONFIRM_INTERVAL = 0.5
+# Wait this long after typing on a believed-ON session, then re-read: a fresh "is active" line means it was OFF.
+_RC_MENU_RENDER_WAIT = 1.0
+
+# Serializes toggles in this process: one keystroke sequence into one terminal at a time.
+_rc_lock = asyncio.Lock()
+
+_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+
+
+def _rc_trusted_origin(request: Request, config: Settings) -> None:
+    """Stricter CSRF gate for the keystroke-injecting toggle (review #4).
+
+    ``cors_origins`` also trusts :5173/:3000 — any local dev server. Enabling
+    Remote Control on the user's live sessions must be reachable only from
+    Karma's own dashboard, so this checks ``rc_trusted_origins`` and also
+    requires a custom header (which a cross-origin simple request cannot set,
+    and setting it forces a CORS preflight the middleware then screens).
+
+    Unlike :func:`_reject_cross_origin`, a **missing** ``Origin`` is rejected
+    too (review). For an endpoint that injects keystrokes, "no Origin" is not
+    worth the benefit of the doubt: it closes DNS-rebinding and the
+    no-Origin-on-same-origin-POST corner, and the dashboard always sends one.
+    Scripted callers can send ``Origin: http://localhost:5180`` explicitly.
+    """
+    origin = request.headers.get("origin")
+    if origin is None:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Remote Control toggling requires an Origin header from the Karma "
+                "dashboard on this machine."
+            ),
+        )
+    if origin not in config.rc_trusted_origins:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"Origin {origin} may not toggle Remote Control — only the Karma "
+                "dashboard on this machine can."
+            ),
+        )
+    if request.headers.get("x-karma-rc") != "1":
+        raise HTTPException(status_code=403, detail="Missing X-Karma-RC header.")
+
+
+def _rc_result(op: dict, final: dict, want: str) -> RemoteControlToggleResult:
+    confirmed = final["state"] == want
+    detail = op["detail"]
+    if not confirmed:
+        detail += " — the transcript hasn't confirmed the new state yet."
+    return RemoteControlToggleResult(
+        sent=bool(op["sent"]),
+        method=op["method"],
+        detail=detail,
+        confirmed=confirmed,
+        state=final["state"],
+        url=final.get("url"),
+    )
+
+
+async def _rc_poll_state(read_state, want: str) -> dict:
+    """Read now, then re-read up to _RC_CONFIRM_ATTEMPTS times until ``want``."""
+    final = await asyncio.to_thread(read_state)
+    for _ in range(_RC_CONFIRM_ATTEMPTS):
+        if final["state"] == want:
+            return final
+        await asyncio.sleep(_RC_CONFIRM_INTERVAL)
+        final = await asyncio.to_thread(read_state)
+    return final
+
+
+@router.post("/{session_id}/remote-control", response_model=RemoteControlToggleResult)
+async def toggle_session_remote_control(
+    session_id: str,
+    body: RemoteControlToggleRequest,
+    request: Request,
+    config: Annotated[Settings, Depends(get_settings)],
+) -> RemoteControlToggleResult:
+    """Turn Claude Code Remote Control on/off for a live session.
+
+    Claude Code has no API for this — the only lever is the ``/remote-control``
+    slash command typed inside the session (tmux / macOS Terminal.app / iTerm2).
+    Turning it **on** is one command; turning it **off** types the command, and
+    Karma opens the "Disconnect Remote Control" menu and raises the terminal for
+    the user to finish.
+
+    Honest by construction: ``sent=false`` means nothing was typed; ``sent=true,
+    confirmed=false`` means keys went but the transcript hasn't caught up.
+    404 unknown session, 400 no/unsupported terminal, 403 wrong or missing origin,
+    409 session not at its prompt / state unreadable / another toggle running.
+    """
+    _rc_trusted_origin(request, config)
+    if not _SESSION_ID_RE.match(session_id):
+        raise HTTPException(status_code=400, detail="Invalid session id.")
+    if _rc_lock.locked():
+        raise HTTPException(
+            status_code=409,
+            detail="Another Remote Control toggle is in progress — try again in a moment.",
+        )
+
+    async with _rc_lock:
+        state = load_live_session(session_id)
+        if state is None:
+            raise HTTPException(status_code=404, detail=f"Live session not found: {session_id}")
+
+        terminal_dict = state.terminal.model_dump() if state.terminal else None
+        if not terminal_dict:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "No terminal information was captured for this session. "
+                    "It may predate terminal tracking, or was started without a TTY."
+                ),
+            )
+        if not await asyncio.to_thread(can_send_remote_control, terminal_dict):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Remote Control toggling needs a live tmux / macOS Terminal.app / "
+                    "iTerm2 session on the machine running Karma (with its process "
+                    "still alive)."
+                ),
+            )
+
+        status = determine_status(state)
+        if status == SessionStatus.ENDED:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Session has ended. Resume it with Remote Control instead: "
+                    f"`claude --resume {state.session_id} --remote-control`."
+                ),
+            )
+        if status in _RC_BLOCKED_STATUSES:
+            reason = {
+                SessionStatus.WAITING_INPUT: "has a prompt open waiting for your answer",
+                SessionStatus.STARTING: "is still starting up",
+            }.get(status, f"is {status.value}")
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Session {reason} — typing /remote-control now could collide with it. "
+                    "Try again once it's ready."
+                ),
+            )
+
+        def read_state() -> dict:
+            return read_remote_control_state(
+                state.transcript_path, state.session_ids, config.projects_dir
+            )
+
+        current = await asyncio.to_thread(read_state)
+        if current["state"] == "unknown":
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Karma can't read this session's Remote Control state from its "
+                    "transcript, so it won't blind-toggle. Use /remote-control in the "
+                    "terminal directly."
+                ),
+            )
+        if current["state"] == body.desired:
+            return RemoteControlToggleResult(
+                sent=False,
+                method="none",
+                detail=f"Remote Control is already {body.desired}.",
+                confirmed=True,
+                state=current["state"],
+                url=current.get("url"),
+            )
+
+        # Step 1 — type `/remote-control` (turns ON if off; opens the disconnect
+        # menu if on).
+        typed = await asyncio.to_thread(type_remote_control_command, terminal_dict)
+        if not typed["sent"]:
+            return RemoteControlToggleResult(
+                sent=False,
+                method=typed["method"],
+                detail=typed["detail"],
+                confirmed=False,
+                state=current["state"],
+                url=current.get("url"),
+            )
+
+        if body.desired == "on":
+            final = await _rc_poll_state(read_state, "on")
+            if final["state"] != "on":
+                # Unconfirmed ON may be a stale "off" that opened the disconnect menu, so raise the terminal like the OFF path.
+                focus = await asyncio.to_thread(focus_terminal, terminal_dict)
+                raised = (
+                    " and brought its terminal to the front"
+                    if focus.get("focused")
+                    else " — check its terminal"
+                )
+                # Not "menu-open" (reserved for the OFF click): this is sent-but-unconfirmed, caveat in `detail`.
+                return RemoteControlToggleResult(
+                    sent=True,
+                    method=typed["method"],
+                    detail=(
+                        f"Typed {RC_COMMAND}{raised}. Remote Control hasn't reported "
+                        "itself on yet — if it was already on, the terminal is now "
+                        "showing the disconnect menu instead; finish or dismiss it there."
+                    ),
+                    confirmed=False,
+                    state=final["state"],
+                    url=final.get("url"),
+                )
+            return _rc_result(typed, final, "on")
+
+        # desired == "off": the command opens the Disconnect menu; Karma raises the terminal and the user picks.
+        await asyncio.sleep(_RC_MENU_RENDER_WAIT)
+        mid = await asyncio.to_thread(read_state)
+        if mid["state"] == "off":
+            return _rc_result(typed, mid, "off")  # already gone (race) — done
+        if (
+            mid["state"] == "on"
+            and mid.get("at")
+            and current.get("at")
+            and str(mid["at"]) > str(current["at"])
+        ):
+            # A new "is active" line: RC was actually OFF and the command turned it ON, no menu.
+            return RemoteControlToggleResult(
+                sent=True,
+                method=typed["method"],
+                detail=(
+                    "Remote Control was off — turned it on instead. Click again to "
+                    "open the disconnect menu."
+                ),
+                confirmed=False,
+                state="on",
+                url=mid.get("url"),
+            )
+
+        # The disconnect menu is open — bring the terminal forward and hand off.
+        focus = await asyncio.to_thread(focus_terminal, terminal_dict)
+        raised = " and brought it to the front" if focus.get("focused") else ""
+        return RemoteControlToggleResult(
+            sent=True,
+            method="menu-open",
+            detail=(
+                f"Opened the “Disconnect Remote Control” menu in this session's terminal{raised} "
+                "— select “Disconnect this session” there."
+            ),
+            confirmed=False,
+            state="on",
+            url=current.get("url"),
+        )
 
 
 # Threshold for allowing cleanup (5 minutes)
