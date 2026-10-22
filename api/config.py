@@ -6,7 +6,7 @@ Example: CLAUDE_KARMA_MAX_AGENT_SIZE=200000
 """
 
 from pathlib import Path
-from typing import List
+from typing import Any, List
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -58,6 +58,13 @@ class Settings(BaseSettings):
     cache_agent_usage_revalidate: int = Field(
         default=600,  # 10 minutes stale-while-revalidate
         description="Stale-while-revalidate duration for agent usage",
+    )
+
+    # Entry format: SETUP.md "Multiple Machines"; also read from ~/.claude_karma/extra-roots.json
+    # Any: env JSON stays raw text, parsed by session_roots, so bad JSON cannot stop startup
+    extra_roots: Any = Field(
+        default_factory=list,
+        description="Synced ~/.claude dirs of other machines to merge into this dashboard",
     )
 
     # SQLite metadata index

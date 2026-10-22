@@ -817,6 +817,62 @@ The hook is silent on every failure (no git, no match, karma unreachable) — it
 
 ---
 
+## Multiple Machines (Optional)
+
+Karma can show sessions from several computers in one dashboard. Karma does **not** sync anything itself: use any tool you like (Syncthing, OneDrive, Dropbox, rsync, a network share) to copy each other machine's `~/.claude` dir somewhere on the machine running Karma, then list those copies as *extra roots*.
+
+### Step M1: Sync the Other Machine's `~/.claude`
+
+Only `projects/` is required. Also syncing `todos/`, `tasks/`, `debug/` and `file-history/` lets session pages show those too. Sync one way (other machine → this one); Karma never writes into an extra root.
+
+### Step M2: Register the Copies
+
+Create `~/.claude_karma/extra-roots.json` (or set `CLAUDE_KARMA_EXTRA_ROOTS` to the same JSON):
+
+```json
+[
+  {
+    "name": "laptop",
+    "path": "D:/Sync/laptop/.claude",
+    "path_map": { "/home/me/code": "C:/Users/me/code" },
+    "project_map": { "-home-me-scratch": "C--Users-me-code-playground" },
+    "match_by_name": false
+  }
+]
+```
+
+Only `path` is required. `name` (letters, digits, `._-`) identifies that machine; it defaults to the name of the folder containing `.claude` (`laptop` above). A root that is a file, duplicates another root's path, or overlaps this machine's own `~/.claude` is ignored with a warning; a path that does not exist yet (drive unmounted, sync paused) is kept. If the file or `CLAUDE_KARMA_EXTRA_ROOTS` fails to parse, Karma keeps the last roots it loaded and skips the "removed root" cleanup until it parses again. While any entry is ignored, that cleanup is skipped too, so a typo never deletes a root's sessions.
+
+### Step M3: How Sessions Are Matched to Projects
+
+Each project dir from another machine joins a local project by the first rule that matches:
+
+| Order | Rule | Needs |
+|-------|------|-------|
+| 1 | `project_map`: explicit `{remote dir: local dir}` | Config |
+| 2 | Same git remote + subdir, read from a `karma-project.json` sidecar | Sidecar on the other machine (below) |
+| 3 | `path_map` prefix rewrite of the remote project path | Config |
+| 4 | Same encoded dir name (identical path on both machines) | Nothing |
+| 5 | Exactly one local project with the same folder name (`"match_by_name": true`, off by default) | Nothing |
+
+Unmatched dirs show as their own project. Rule 5 is a guess: a remote `api` or `web` folder would silently join whichever local project shares the name, so turn it on only for a root whose projects you know.
+
+`path_map` prefixes are case-insensitive for Windows paths (drive letter or UNC) and case-sensitive otherwise.
+
+**Sidecars** make matching exact. A machine that runs Karma with at least one extra root configured writes one into each local git project's dir (one with an `origin` remote) on every index pass. A machine without extra roots never writes into `~/.claude/projects`; install the `project_identity.py` hook there instead (see [Hook Configuration Reference](#hook-configuration-reference)). Machines with neither fall back to rules 1 and 3–5.
+
+### Step M4: Verify
+
+```bash
+curl -s -X POST "http://localhost:8020/extra-roots/refresh" | python3 -m json.tool
+```
+
+`GET /extra-roots` returns the same without rescanning. Both answer only from this machine.
+
+Each project dir lists `project_encoded_name` and `matched_by`. A full re-index runs every `CLAUDE_KARMA_REINDEX_INTERVAL_SECONDS` (default 300); restart the API to pick up a new root at once.
+
+---
+
 ## Hook Configuration Reference
 
 ### Complete Configuration (All Tiers)
@@ -989,6 +1045,7 @@ CLAUDE_KARMA_LOG_LEVEL=DEBUG uvicorn main:app --reload --port 8020
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `CLAUDE_KARMA_CLAUDE_BASE` | `~/.claude` | Base directory for Claude Code data |
+| `CLAUDE_KARMA_EXTRA_ROOTS` | `[]` | JSON list of other machines' synced `~/.claude` dirs (see [Multiple Machines](#multiple-machines-optional)) |
 | `CLAUDE_KARMA_USE_SQLITE` | `true` | Enable SQLite index (`false` = JSONL-only mode) |
 | `CLAUDE_KARMA_LOG_LEVEL` | `INFO` | Logging level (DEBUG, INFO, WARNING, ERROR) |
 
