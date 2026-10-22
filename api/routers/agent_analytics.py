@@ -15,6 +15,7 @@ from typing import Optional
 
 from cachetools import TTLCache, cached
 
+from config import settings
 from schemas import (
     AgentCategory,
     AgentInvocation,
@@ -56,8 +57,8 @@ BUILTIN_AGENTS = {
 
 
 def get_custom_agents_dir() -> Path:
-    """Get the ~/.claude/agents directory."""
-    return Path.home() / ".claude" / "agents"
+    """Get the agents dir under settings.claude_base (~/.claude/agents by default)."""
+    return settings.claude_base / "agents"
 
 
 def _agent_file_exists(agents_dir: Path, name: str) -> bool:
@@ -75,21 +76,25 @@ def _get_all_project_agent_names() -> frozenset[str]:
     Cached with 120s TTL to avoid repeated filesystem scans.
     """
     agent_names: set[str] = set()
-    projects_dir = Path.home() / ".claude" / "projects"
-    if not projects_dir.exists():
-        return frozenset()
+    projects_dir = settings.projects_dir
+    encoded_names: list[str] = []
 
     # Each subdirectory in ~/.claude/projects/ is an encoded project path.
     # Decode it to find the real project directory, then check .claude/agents/.
-    for encoded_dir in projects_dir.iterdir():
-        if not encoded_dir.is_dir() or encoded_dir.name.startswith("."):
-            continue
-        if not is_encoded_project_dir(encoded_dir.name):
-            continue
+    if projects_dir.exists():
+        for encoded_dir in projects_dir.iterdir():
+            if not encoded_dir.is_dir() or encoded_dir.name.startswith("."):
+                continue
+            if not is_encoded_project_dir(encoded_dir.name):
+                continue
+            encoded_names.append(encoded_dir.name)
+
+    # Synced roots add nothing here: their projects' .claude/agents dirs live on the other machine
+    for encoded_name in encoded_names:
         # Decode to real project path using Project model
         from models.project import Project
 
-        decoded_path = Project.decode_path(encoded_dir.name)
+        decoded_path = Project.decode_path(encoded_name)
         project_dir = Path(decoded_path)
         if not project_dir.is_dir():
             continue

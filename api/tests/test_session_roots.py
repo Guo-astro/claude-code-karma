@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -661,6 +662,241 @@ def test_no_roots_means_no_sidecar_write(tmp_path, monkeypatch, mem_db):
     session_roots.clear_cache()
     indexer.sync_all_projects(mem_db)
     assert read_sidecar(local / "projects" / encoded)["git_identity"] == "o/repo"
+
+
+# =============================================================================
+# Views: browser, detail, lookup, relationships (coverage PR)
+# =============================================================================
+
+
+def _client():
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    from main import app
+
+    return TestClient(app, base_url="http://localhost", client=("127.0.0.1", 50000))
+
+
+@pytest.fixture
+def jsonl_only(monkeypatch):
+    """Force the JSONL code paths so tests never touch the developer's metadata.db."""
+    monkeypatch.setattr(settings, "use_sqlite", False)
+
+
+def test_browser_dedupes_and_tags_synced_sessions(machines, jsonl_only):
+    local, remote, _ = machines
+    _write_session(local / "-Users-me-repo", "l1", "/Users/me/repo")
+    _write_session(remote / "-Users-me-repo", "l1", "/Users/me/repo")  # synced back
+    _write_session(remote / "-Users-me-repo", "r1", "/Users/me/repo")
+    (remote / "-Users-me-repo" / "r2.jsonl").write_text("{not json\n", encoding="utf-8")  # mid-sync
+
+    body = _client().get("/sessions/all").json()
+    by_uuid = {s["uuid"]: s["machine"] for s in body["sessions"]}
+    assert by_uuid == {"l1": None, "r1": "laptop"}
+
+
+def test_detail_reports_machine(machines, jsonl_only):
+    local, remote, _ = machines
+    _write_session(local / "-Users-me-repo", "l1", "/Users/me/repo")
+    _write_session(remote / "-Users-me-repo", "r1", "/Users/me/repo")
+
+    client = _client()
+    assert client.get("/sessions/r1").json()["machine"] == "laptop"
+    assert client.get("/sessions/l1").json()["machine"] is None
+
+
+def test_no_roots_paths_are_local(tmp_path, monkeypatch):
+    local = tmp_path / ".claude"
+    (local / "projects").mkdir(parents=True)
+    monkeypatch.setattr(settings, "claude_base", local)
+    monkeypatch.setattr(settings, "extra_roots", [])
+    session_roots.clear_cache()
+
+    assert session_jsonl_path("-x", "u1") == local / "projects" / "-x" / "u1.jsonl"
+    assert session_roots.project_dirs_for("-x") == [local / "projects" / "-x"]
+
+
+def test_indexed_location_uses_source_root(machines, mem_db, monkeypatch):
+    from contextlib import contextmanager
+
+    import db.connection
+    from services import session_lookup
+
+    local, remote, _ = machines
+    _write_session(local / "-Users-me-repo", "l1", "/Users/me/repo")
+    r1 = _write_session(remote / "-home-me-solo", "r1", "/home/me/solo")
+    indexer.sync_all_projects(mem_db)
+
+    @contextmanager
+    def fake_read():
+        yield mem_db
+
+    monkeypatch.setattr(db.connection, "sqlite_read", fake_read)
+
+    hit = session_lookup._indexed_location("r1")
+    assert (hit.session.jsonl_path, hit.project_encoded_name) == (r1, "-home-me-solo")
+    assert session_lookup._indexed_location("l1").project_encoded_name == "-Users-me-repo"
+    r1.unlink()  # index stale: caller falls back to the scan
+    assert session_lookup._indexed_location("r1") is None
+
+
+def test_short_id_prefix_hits_span_local_and_remote(machines):
+    pytest.importorskip("fastapi")  # the models-only CI job has no web deps
+    from routers.sessions import _find_session_files
+
+    local, remote, _ = machines
+    _write_session(
+        local / "-Users-me-repo", "abcd1234-0000-0000-0000-000000000000", "/Users/me/repo"
+    )
+    _write_session(
+        remote / "-home-me-solo", "abcd5678-0000-0000-0000-000000000000", "/home/me/solo"
+    )
+    _write_session(
+        remote / "-Users-me-repo", "abcd1234-0000-0000-0000-000000000000", "/Users/me/repo"
+    )
+
+    found = sorted((p.stem[:8], name) for p, name in _find_session_files("abcd"))
+    assert found == [("abcd1234", "-Users-me-repo"), ("abcd5678", "-home-me-solo")]
+    # An exact id wins outright, as in the local loop
+    (exact,) = _find_session_files("abcd5678-0000-0000-0000-000000000000")
+    assert exact[1] == "-home-me-solo"
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32" or getattr(os, "geteuid", lambda: -1)() == 0,
+    reason="needs file permissions that bind the current user",
+)
+def test_browser_skips_unreadable_synced_file(machines, jsonl_only):
+    local, remote, _ = machines
+    l1, merged_ok, merged_bad, solo_ok, solo_bad = (
+        f"0000000{i}-0000-0000-0000-000000000000" for i in range(5)
+    )
+    _write_session(local / "-Users-me-repo", l1, "/Users/me/repo")
+    _write_session(remote / "-Users-me-repo", merged_ok, "/Users/me/repo")
+    _write_session(remote / "-home-me-solo", solo_ok, "/home/me/solo")
+    # Unreadable, like a file a sync client holds locked: in a merged and in a remote-only project
+    _write_session(remote / "-Users-me-repo", merged_bad, "/Users/me/repo").chmod(0)
+    _write_session(remote / "-home-me-solo", solo_bad, "/home/me/solo").chmod(0)
+
+    body = _client().get("/sessions/all").json()
+    assert sorted(s["uuid"] for s in body["sessions"]) == sorted([l1, merged_ok, solo_ok])
+
+
+def test_find_session_with_project_uses_index_for_synced_session(machines, mem_db, monkeypatch):
+    from contextlib import contextmanager
+
+    import db.connection
+    from services import session_lookup
+
+    local, remote, _ = machines
+    _write_session(local / "-Users-me-repo", "l1", "/Users/me/repo")
+    r1 = _write_session(remote / "-home-me-solo", "r1", "/home/me/solo")
+    indexer.sync_all_projects(mem_db)
+
+    @contextmanager
+    def fake_read():
+        yield mem_db
+
+    monkeypatch.setattr(db.connection, "sqlite_read", fake_read)
+    get_remote_dirs()  # warm the root mapping, which lists dirs itself
+    scans = []
+    monkeypatch.setattr(session_roots, "find_any_remote_session", lambda uuid: scans.append(uuid))
+    real_iterdir = Path.iterdir
+    monkeypatch.setattr(Path, "iterdir", lambda self: scans.append(self) or real_iterdir(self))
+
+    hit = session_lookup.find_session_with_project("r1")
+    assert (hit.session.jsonl_path, hit.project_encoded_name) == (r1, "-home-me-solo")
+    # Local copy appears after indexing: it wins over the synced one the index points at
+    local_copy = _write_session(local / "-home-me-solo", "r1", "/home/me/solo")
+    assert session_lookup.find_session_with_project("r1").session.jsonl_path == local_copy
+    assert scans == []
+
+
+def test_relationship_resolver_prefers_local_copy(machines):
+    from services.session_relationships import SessionRelationshipResolver
+
+    local, remote, _ = machines
+    _write_session(local / "-Users-me-repo", "s1", "/Users/me/repo")
+    _write_session(remote / "-Users-me-repo", "s1", "/Users/me/repo")
+
+    resolver = SessionRelationshipResolver(remote / "-Users-me-repo")
+    assert resolver.session_dirs[0] == local / "-Users-me-repo"
+    assert resolver._get_session("s1").jsonl_path == local / "-Users-me-repo" / "s1.jsonl"
+
+
+def test_skill_and_command_detail_report_machine(machines, monkeypatch):
+    from contextlib import contextmanager
+
+    import db.connection
+
+    local, remote, _ = machines
+    _write_session(local / "-Users-me-repo", "l1", "/Users/me/repo")
+    _write_session(remote / "-home-me-solo", "r1", "/home/me/solo")
+    # The endpoints read on the test client's thread
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    ensure_schema(conn)
+    indexer.sync_all_projects(conn)
+    for uuid in ("l1", "r1"):
+        conn.execute(
+            "INSERT INTO session_skills (session_uuid, skill_name) VALUES (?, 'sk')", (uuid,)
+        )
+        conn.execute(
+            "INSERT INTO session_commands (session_uuid, command_name) VALUES (?, 'cmd')", (uuid,)
+        )
+
+    @contextmanager
+    def fake_read():
+        yield conn
+
+    monkeypatch.setattr(db.connection, "sqlite_read", fake_read)
+    client = _client()
+    for url in ("/skills/sk/detail", "/commands/cmd/detail"):
+        sessions = client.get(url).json()["sessions"]
+        assert {s["uuid"]: s["machine"] for s in sessions} == {"l1": None, "r1": "laptop"}, url
+
+
+@pytest.fixture
+def resume_launcher(monkeypatch):
+    """Record resume launches instead of opening a terminal; no live session for any uuid."""
+    pytest.importorskip("fastapi")
+    from models import live_session
+    from services import terminal_launch
+
+    launched = []
+    monkeypatch.setattr(live_session, "load_live_session", lambda uuid: None)
+    monkeypatch.setattr(
+        terminal_launch,
+        "launch_resume_in_terminal",
+        lambda cwd, uuid, term_program=None: launched.append((cwd, uuid)) or {"launched": True},
+    )
+    return launched
+
+
+def test_resume_refuses_a_session_synced_from_another_machine(machines, tmp_path, resume_launcher):
+    _, remote, _ = machines
+    uuid = "abcd5678-0000-0000-0000-000000000000"
+    _write_session(remote / "-home-me-solo", uuid, str(tmp_path))
+
+    resp = _client().post(f"/sessions/{uuid}/resume-in-terminal")
+    assert resp.status_code == 409
+    assert "laptop" in resp.json()["detail"]
+    assert resume_launcher == []
+
+
+def test_resume_uses_the_local_copy_of_a_synced_session(machines, tmp_path, resume_launcher):
+    local, remote, _ = machines
+    uuid = "abcd1234-0000-0000-0000-000000000000"
+    here, there = tmp_path / "here", tmp_path / "there"
+    here.mkdir()
+    there.mkdir()
+    _write_session(remote / "-Users-me-repo", uuid, str(there))
+    _write_session(local / "-Users-me-repo", uuid, str(here))
+
+    resp = _client().post(f"/sessions/{uuid}/resume-in-terminal")
+    assert resp.status_code == 200, resp.text
+    assert resume_launcher == [(str(here), uuid)]
 
 
 def test_extra_roots_endpoints(machines):
