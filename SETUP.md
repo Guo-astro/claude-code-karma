@@ -1011,6 +1011,35 @@ If you installed the branch detector hook in Tier 4, add it to `SessionStart` al
 
 The branch detector has no timeout entry because it self-times-out at 2 seconds and is silent on every failure.
 
+### Project Identity Sidecar (Multiple Machines)
+
+`project_identity.py` writes `karma-project.json` (normalized git remote, subdir within the repo, project path) into the session's project dir on each session start. The file records which repository a project dir belongs to, independent of where the repo lives on disk; tools that read synced copies of `~/.claude` from several machines can use it to match the same project across different paths. The hook writes nothing else.
+
+```bash
+ln -sf "$(cd hooks && pwd)/project_identity.py" ~/.claude/hooks/project_identity.py
+```
+
+```json
+"SessionStart": [
+  {
+    "hooks": [
+      {
+        "type": "command",
+        "command": "python3 ~/.claude/hooks/project_identity.py",
+        "timeout": 10
+      }
+    ]
+  }
+]
+```
+
+Like the branch detector, it is silent on every failure; each of its two git calls self-times-out at 2 seconds (4 seconds worst case), so the 10-second timeout is a safety net. It only writes when the identity changed, and only into the session's project dir (a dir inside a `projects` dir).
+
+Two things to know about the sidecar's lifecycle:
+
+- The hook only ever writes. If the `origin` remote is later removed (or the directory stops being a git checkout), the hook writes nothing and the existing `karma-project.json` stays as it was. Delete it by hand if the stale identity matters.
+- The hook compares only `git_identity`, `subdir` and `project_path`. When any of those changed, it rewrites the whole file, so any extra keys another tool added are lost.
+
 ### Removing a Hook
 
 To remove a hook after installation:
@@ -1020,6 +1049,7 @@ To remove a hook after installation:
 | Live tracker | Delete all `live_session_tracker.py` entries from `"hooks"` in settings.json |
 | Title generator | Delete the `session_title_generator.py` entry from `"SessionEnd"` |
 | Branch detector | Delete the `ticket_branch_detector.py` entry from `"SessionStart"`, or just set `"branch_detect_enabled": false` in `~/.claude_karma/config.json` to keep the hook installed but inert |
+| Project identity | Delete the `project_identity.py` entry from `"SessionStart"`. Existing `karma-project.json` files stay in place; delete them by hand if you no longer want them |
 
 Then optionally clean up the script:
 ```bash
