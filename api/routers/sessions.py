@@ -974,8 +974,10 @@ def get_session(uuid: str, request: Request, fresh: bool = False):
     if fresh:
         session.clear_cache()
 
-    # Phase 3: Check conditional request headers (single stat() call)
-    etag, last_modified = get_file_cache_info(session.jsonl_path)
+    # Phase 3: Conditional request; subagent files count since they feed the subagent totals
+    etag, last_modified = get_file_cache_info(
+        session.jsonl_path, session.subagents_dir.glob("agent-*.jsonl")
+    )
 
     conditional_response = check_conditional_request(request, etag, last_modified)
     if conditional_response:
@@ -983,6 +985,7 @@ def get_session(uuid: str, request: Request, fresh: bool = False):
 
     # Build full response
     usage = session.get_usage_summary()
+    subagent_usage, subagent_cost = session.get_subagent_totals()
     tools_used = session.get_tools_used()
     skills_used = session.get_skills_used()
     skills_mentioned = session.get_skills_mentioned()
@@ -1071,6 +1074,10 @@ def get_session(uuid: str, request: Request, fresh: bool = False):
         cache_hit_rate=usage.cache_hit_rate,
         cache_read_tokens=usage.cache_read_input_tokens,
         total_cost=session.get_total_cost(),
+        subagent_input_tokens=subagent_usage.total_input,
+        subagent_output_tokens=subagent_usage.output_tokens,
+        subagent_cache_read_tokens=subagent_usage.cache_read_input_tokens,
+        subagent_cost=subagent_cost,
         todos=todos,
         tasks=tasks,
         has_tasks=session.has_tasks,
